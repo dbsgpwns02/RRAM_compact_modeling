@@ -1,0 +1,209 @@
+// ----------------------------------------------------
+//  NARX-based RRAM compact model (HSPICE-safe 3-file version)
+//  - Main Shell File (auto-generated, [CONTINUOUS Ver.])
+//  - numeric assignments: `include "narx_rram_assign.vams"
+//  - unrolled math:       `include "narx_rram_unrolled_math.inc"
+// ----------------------------------------------------
+`include "constants.vams"
+`include "disciplines.vams"
+
+module narx_rram(g, s);
+  inout g, s;
+  electrical g, s;
+
+  // ================== Parameters ==================
+  parameter real Ts         = 1.0000000000000001e-09;
+  parameter integer N_warmup = 40;
+  parameter integer INIT_W   = 1;
+  parameter real V_FILTER    = 1.0000000000000000e-02;
+  parameter real Rref_min    = -8.3538619995117188e+01;
+  parameter real Rref_max    = 8.6586715698242188e+01;
+  
+  parameter real tau_slew    = 2e-09 from [0:inf);
+  parameter real R_clip_min  = 1.0000000000000000e+02;
+  parameter real R_clip_max  = 1.0000000000000000e+08;
+  parameter integer DBG      = 0;
+  parameter real time_step   = 1.0000000000000001e-09; 
+
+  // --- [신규] 연속적 모델(Continuous Model) 파라미터 ---
+  parameter real V_READ_TH       = 5.9999999999999998e-01;
+  parameter real V_smooth_filter = 5.0000000000000001e-03;
+  parameter real V_smooth_read   = 1.0000000000000001e-01;
+  parameter real hyst_smooth     = 1.0000000000000001e-01;
+
+  // ================== Sizes (모델 구조) ==================
+  integer ny, z_dim, in_dim;
+  integer hr_lr_in_dim, hr_lr_hid_dim;
+  integer i, m; // for-loop 인덱스
+
+  // ================== States / temps ==================
+  real V_prev_raw;
+  real dV, dir, rate;
+  real I_hold;
+  real I_pred;
+  integer k_sample_total;
+  integer k_eff;
+  real R_last, G_last;
+
+  // ================== Input / feature buffers ==================
+  real x_raw[0:7];
+  real x_scl[0:7];
+
+  // ================== Scaler/Weights/Biases (assign에서 대입) ==================
+  real mean_[0:7];
+  real scale_[0:7];
+  real bz_[0:63];
+  real Wz_[0:511];
+  real Wref_[0:63];
+  real bref_;
+  real Whr1_[0:2079];
+  real bhr1_[0:31];
+  real Whr2_[0:31];
+  real bhr2_;
+  real Wlr1_[0:2079];
+  real blr1_[0:31];
+  real Wlr2_[0:31];
+  real blr2_;
+
+  // ================== Network intermediates (unrolled가 써 넣음) ==================
+  real z[0:63];
+  real hr_h[0:31];
+  real lr_h[0:31];
+
+  // ================== Digital history ==================
+  real W_hist[0:4];
+
+  // ================== Outputs / temps ==================
+  real r_ref_logit, v_scl, log_hr, log_lr;
+  real hr_val, lr_val, alpha, R_pred;
+  real W_next, Vgs;
+  real alpha_slew;
+  
+  // --- [신규] 연속적 모델을 위한 내부 변수 ---
+  real I_pred_skip, R_pred_skip;
+  real I_pred_valid, R_pred_valid;
+  real gate_valid, gate_write;
+  real W_current, W_target;
+
+
+  // --- 가중치/바이어스/스케일러 로드 ---
+  `include "narx_rram_assign.vams"
+
+  analog begin
+    $bound_step(Ts);
+
+    @(initial_step("tran")) begin
+      ny              = 5;
+      z_dim           = 64;
+      in_dim          = 8;
+      hr_lr_in_dim    = 65;
+      hr_lr_hid_dim   = 32;
+
+      V_prev_raw = V(g, s);
+      I_hold     = 0.0;
+      I_pred     = 0.0;
+      R_last     = R_clip_min; // R_pred의 초기값
+      G_last     = 1.0 / R_last;
+      k_sample_total = 0;
+      k_eff      = 0;
+
+      for (i = 0; i <= ny-1; i = i+1) W_hist[i] = INIT_W;
+
+      if (DBG) $strobe("narx_rram: loaded (ny=%0d, z_dim=%0d, in_dim=%0d, V_FILTER=%g, tau_slew=%g)", 
+                        ny, z_dim, in_dim, V_FILTER, tau_slew);
+    end
+
+    // 출력: ZOH(+LPF)
+    I(g, s) <+ I_hold;
+
+    // ========================================================
+    // 메인 업데이트 (if 분기 없는 연속적 로직)
+    // ========================================================
+    @(timer(0, Ts)) begin
+      Vgs = V(g, s);
+
+      dV   = Vgs - V_prev_raw;
+      dir  = (dV > 0) ? 1.0 : ((dV < 0.0) ? -1.0 : 0.0);
+      rate = abs(dV);
+
+      alpha_slew = (tau_slew <= 0.0) ? 1.0 : (Ts / (tau_slew + Ts));
+      if (alpha_slew > 1.0) alpha_slew = 1.0;
+      else if (alpha_slew < 0.0) alpha_slew = 0.0;
+      
+      // --- [수정] 1. 'SKIP' 구간 계산 (G_last 기준) ---
+      I_pred_skip = Vgs * G_last;
+      R_pred_skip = R_last;
+
+      // --- [수정] 2. 'VALID' 구간 계산 (신경망 ON) ---
+      x_raw[0] = Vgs;
+      x_raw[1] = dir;
+      x_raw[2] = rate;
+      for (i = 0; i <= ny-1; i = i+1) x_raw[i+3] = W_hist[i];
+
+      for (i = 0; i <= in_dim-1; i = i+1)
+        x_scl[i] = (x_raw[i] - mean_[i]) / scale_[i];
+
+      v_scl = x_scl[0];
+
+      `include "narx_rram_unrolled_math.inc"
+
+      hr_val = exp(log_hr);
+      lr_val = exp(log_lr);
+
+      alpha = (r_ref_logit - Rref_min) / (Rref_max - Rref_min);
+      if (alpha < 0.0) alpha = 0.0;
+      else if (alpha > 1.0) alpha = 1.0;
+
+      R_pred_valid = alpha * hr_val + (1.0 - alpha) * lr_val;
+      if (R_pred_valid < R_clip_min) R_pred_valid = R_clip_min;
+      if (R_pred_valid > R_clip_max) R_pred_valid = R_clip_max;
+
+      I_pred_valid = (R_pred_valid != 0.0) ? (Vgs / R_pred_valid) : 0.0;
+      
+      // --- [수정] 3. 'Soft Switch 1' (gate_valid)로 SKIP/VALID 혼합 ---
+      // |Vgs|가 V_FILTER보다 크면 gate_valid=1, 작으면 0
+      gate_valid = 0.5 * (1.0 + tanh((abs(Vgs) - V_FILTER) / V_smooth_filter));
+      
+      // (if문 대체) 두 전류/저항을 부드럽게 혼합
+      I_pred = (1.0 - gate_valid) * I_pred_skip + gate_valid * I_pred_valid;
+      R_pred = (1.0 - gate_valid) * R_pred_skip + gate_valid * R_pred_valid;
+
+      // LPF (혼합된 최종 전류에 적용)
+      I_hold = I_hold + alpha_slew * (I_pred - I_hold);
+
+      // R_last, G_last 업데이트 (다음 스텝의 'SKIP' 계산용)
+      R_last = R_pred;
+      G_last = (R_last != 0.0) ? (1.0 / R_last) : (1.0 / R_clip_min);
+
+      // --- [수정] 4. 'Soft Switch 2' (gate_write)로 상태(W_hist) 업데이트 ---
+
+      // 4-1. 현재 상태
+      W_current = W_hist[0];
+      
+      // 4-2. 목표 상태 (Soft HYST): r_ref_logit > 0 이면 1, < 0 이면 0
+      W_target = 0.5 * (1.0 + tanh(r_ref_logit / hyst_smooth));
+      
+      // 4-3. 쓰기 게이트: |Vgs| > V_READ_TH 이면 1 (쓰기), 작으면 0 (읽기)
+      gate_write = 0.5 * (1.0 + tanh((abs(Vgs) - V_READ_TH) / V_smooth_read));
+
+      // 4-4. 최종 W_next 결정 (혼합): '읽기'면 W_current, '쓰기'면 W_target
+      W_next = (1.0 - gate_write) * W_current + gate_write * W_target;
+
+      // --- [수정] 5. 상태 히스토리(W_hist) 업데이트 ---
+      // (기존 'W_next = ... ? 1:0' 라인 삭제)
+      
+      if (k_eff >= N_warmup) begin
+        for (m = ny-1; m >= 1; m = m-1)
+          W_hist[m] = W_hist[m-1];
+        W_hist[0] = W_next;
+      end
+      k_eff = k_eff + 1;
+
+      if (DBG) $strobe("LOG t=%g V=%g | gate_V=%.3f gate_W=%.3f | r_ref=%.3f W_targ=%.3f W_next=%.3f | R=%.3e I=%.3e",
+                        $abstime, Vgs, gate_valid, gate_write, r_ref_logit, W_target, W_next, R_pred, I_hold);
+
+      V_prev_raw = Vgs;
+      k_sample_total = k_sample_total + 1;
+    end
+  end
+endmodule
