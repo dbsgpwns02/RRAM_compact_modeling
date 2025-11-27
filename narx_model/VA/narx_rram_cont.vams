@@ -1,0 +1,235 @@
+// ----------------------------------------------------
+//  NARX-based RRAM compact model (Continuous, HSPICE-safe)
+//  - Logic matched to debug_spice_sampling_va_matched_CONTINUOUS
+// ----------------------------------------------------
+`include "constants.vams"
+`include "disciplines.vams"
+
+module narx_rram_cont(g, s);
+  inout g, s;
+  electrical g, s;
+
+  // ================== Parameters ==================
+  parameter real Ts          = 1.0000000000000001e-09;
+  parameter integer N_warmup = 40;
+  parameter integer INIT_W   = 1;
+
+  // READ/WRITE soft gate 기준
+  parameter real V_READ_TH     = 5.9999999999999998e-01;
+  parameter real V_smooth_read = 1.0000000000000001e-01;
+  parameter real hyst_smooth   = 1.0000000000000001e-01;
+
+  parameter real V_FILTER    = 1.0000000000000000e-02; // (실제 연산에는 사용하지 않음)
+  parameter real Rref_min    = -2.0870411682128906e+02;
+  parameter real Rref_max    = 2.0896453857421875e+02;
+
+  // LPF (초기 스파이크 제어)
+  parameter real tau_slew    = 2e-09 from [0:inf);
+
+  parameter real R_clip_min  = 1.0000000000000000e+02;
+  parameter real R_clip_max  = 1.0000000000000000e+08;
+  parameter integer DBG      = 0;
+  parameter real time_step   = 1.0000000000000001e-09;
+
+  // ================== Sizes ==================
+  integer ny, z_dim, in_dim;
+  integer hr_lr_in_dim, hr_lr_hid_dim;
+  integer i, m;
+
+  // ================== States / temps ==================
+  real V_prev_raw;
+  real dV, dir, rate;
+  real I_hold;          // LPF 출력
+  real I_pred_raw;      // gate + NN 결과 (LPF 입력)
+  real R_last, G_last;  // 마지막 유효 저항 / 컨덕턴스
+  real r_ref_last_valid; // READ 중에 유지할 r_ref
+  integer k_sample_total;
+  integer k_eff;
+
+  // ================== Input / feature buffers ==================
+  real x_raw[0:7];
+  real x_scl[0:7];
+
+  // ================== Scaler buffers ==================
+  real mean_[0:7];
+  real scale_[0:7];
+
+  // ================== Weights / Biases ==================
+  real bz_[0:63];
+  real Wz_[0:511];
+
+  real Wref_[0:63];
+  real bref_;
+
+  real Whr1_[0:2079];
+  real bhr1_[0:31];
+  real Whr2_[0:31];
+  real bhr2_;
+
+  real Wlr1_[0:2079];
+  real blr1_[0:31];
+  real Wlr2_[0:31];
+  real blr2_;
+
+  // ================== Network intermediates ==================
+  real z[0:63];
+  real hr_h[0:31];
+  real lr_h[0:31];
+
+  // ================== Digital history ==================
+  real W_hist[0:4];
+
+  // ================== Outputs / temps ==================
+  real r_ref_logit, v_scl, log_hr, log_lr;
+  real hr_val, lr_val, alpha_write, R_pred_write, I_pred_write;
+  real alpha_read;
+  real R_pred_read, I_pred_read;
+  real R_pred;
+  real gate_write;
+  real W_current, W_target, W_next;
+  real Vgs;
+  real alpha_slew;
+
+  // --- 가중치/스케일러 로드 ---
+  `include "narx_rram_cont_assign.vams"
+
+  analog begin
+    $bound_step(Ts);
+
+    @(initial_step("tran")) begin
+      ny            = 5;
+      z_dim         = 64;
+      in_dim        = 8;
+      hr_lr_in_dim  = 65;
+      hr_lr_hid_dim = 32;
+
+      V_prev_raw = V(g, s);
+      I_hold     = 0.0;
+      I_pred_raw = 0.0;
+      R_last     = R_clip_min;
+      G_last     = 1.0 / R_last;
+      k_sample_total = 0;
+      k_eff      = 0;
+
+      // INIT_W 에 따라 r_ref_last_valid 초기화
+      if (INIT_W == 1)
+        r_ref_last_valid = Rref_max;
+      else
+        r_ref_last_valid = Rref_min;
+
+      for (i = 0; i <= ny-1; i = i+1)
+        W_hist[i] = INIT_W;
+
+      if (DBG) $strobe("narx_rram_cont_cont: init (ny=%0d, z_dim=%0d, in_dim=%0d)", 
+                       ny, z_dim, in_dim);
+    end
+
+    // 출력: LPF 결과
+    I(g, s) <+ I_hold;
+
+    @(timer(0, Ts)) begin
+      Vgs = V(g, s);
+
+      dV  = Vgs - V_prev_raw;
+      dir = (dV > 0) ?  1 : ((dV < 0) ? -1 : 0);
+      rate = abs(dV);
+
+      // LPF 계수
+      if (tau_slew <= 0.0)
+        alpha_slew = 1.0;
+      else
+        alpha_slew = Ts / (tau_slew + Ts);
+      if (alpha_slew > 1.0) alpha_slew = 1.0;
+      else if (alpha_slew < 0.0) alpha_slew = 0.0;
+
+      // ----------------------------------------------------
+      // 1) READ 경로 (이전 상태 기반)
+      // ----------------------------------------------------
+      I_pred_read  = Vgs * G_last;
+      R_pred_read  = R_last;
+      alpha_read   = (r_ref_last_valid - Rref_min) / (Rref_max - Rref_min);
+      if (alpha_read < 0.0) alpha_read = 0.0;
+      else if (alpha_read > 1.0) alpha_read = 1.0;
+      // log_hr/log_lr 는 READ 중 의미 없으니 0 취급
+
+      // ----------------------------------------------------
+      // 2) WRITE 경로 (NN 한 번 실행)
+      // ----------------------------------------------------
+      x_raw[0] = Vgs;
+      x_raw[1] = dir;
+      x_raw[2] = rate;
+      for (i = 0; i <= ny-1; i = i+1)
+        x_raw[i+3] = W_hist[i];
+
+      for (i = 0; i <= in_dim-1; i = i+1)
+        x_scl[i] = (x_raw[i] - mean_[i]) / scale_[i];
+
+      v_scl = x_scl[0];
+
+      `include "narx_rram_cont_unrolled_math.inc"
+
+      hr_val = exp(log_hr);
+      lr_val = exp(log_lr);
+
+      alpha_write = (r_ref_logit - Rref_min) / (Rref_max - Rref_min);
+      if (alpha_write < 0.0) alpha_write = 0.0;
+      else if (alpha_write > 1.0) alpha_write = 1.0;
+
+      R_pred_write = alpha_write * hr_val + (1.0 - alpha_write) * lr_val;
+      if (R_pred_write < R_clip_min) R_pred_write = R_clip_min;
+      if (R_pred_write > R_clip_max) R_pred_write = R_clip_max;
+
+      if (R_pred_write != 0.0)
+        I_pred_write = Vgs / R_pred_write;
+      else
+        I_pred_write = 0.0;
+
+      // ----------------------------------------------------
+      // 3) Soft gate (READ/WRITE blending)
+      // gate_write = 0.5 * (1 + tanh((|V|-V_READ_TH)/V_smooth_read))
+      // ----------------------------------------------------
+      gate_write = 0.5 * (1.0 + tanh((abs(Vgs) - V_READ_TH) / V_smooth_read));
+
+      I_pred_raw = (1.0 - gate_write) * I_pred_read  + gate_write * I_pred_write;
+      R_pred     = (1.0 - gate_write) * R_pred_read  + gate_write * R_pred_write;
+
+      // r_ref/log_hr/log_lr 도 동일하게 블렌딩
+      r_ref_logit = (1.0 - gate_write) * r_ref_last_valid + gate_write * r_ref_logit;
+      // READ 쪽 log_hr/log_lr=0 이라서 WRITE 값 * gate_write 와 동일
+      // alpha 또한 read/write 섞어서 쓸 수 있지만, 실제로는 R_pred만 사용
+
+      // LPF 적용
+      I_hold = I_hold + alpha_slew * (I_pred_raw - I_hold);
+
+      // 다음 step을 위해 마지막 유효값 업데이트
+      R_last          = R_pred;
+      if (R_last < R_clip_min) R_last = R_clip_min;
+      if (R_last > R_clip_max) R_last = R_clip_max;
+      G_last          = 1.0 / R_last;
+      r_ref_last_valid = r_ref_logit;
+
+      // ----------------------------------------------------
+      // 4) 상태 W_hist 업데이트 (continuous)
+      // W_target = 0.5*(1 + tanh(r_ref / hyst_smooth))
+      // W_next   = (1-gate)*W_current + gate*W_target
+      // ----------------------------------------------------
+      W_current = W_hist[0];
+      W_target  = 0.5 * (1.0 + tanh(r_ref_logit / hyst_smooth));
+      W_next    = (1.0 - gate_write) * W_current + gate_write * W_target;
+
+      if (k_eff >= N_warmup) begin
+        for (m = ny-1; m >= 1; m = m-1)
+          W_hist[m] = W_hist[m-1];
+        W_hist[0] = W_next;
+      end
+
+      if (DBG) $strobe("LOG t=%g V=%g dV=%g | gate_W=%g | r_ref=%g W_targ=%g W_next=%g | R=%g I_raw=%g I_lpf=%g",
+                       $abstime, Vgs, dV, gate_write, r_ref_logit, W_target, W_next,
+                       R_pred, I_pred_raw, I_hold);
+
+      V_prev_raw = Vgs;
+      k_eff = k_eff + 1;
+      k_sample_total = k_sample_total + 1;
+    end
+  end
+endmodule

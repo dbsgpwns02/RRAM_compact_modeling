@@ -13,10 +13,10 @@ from sklearn.preprocessing import StandardScaler # 로드에 필요
 
 # [필수] 1. 필요한 함수들 import
 from generate_pwl import generate_v_data_from_spice_pwl
-from export_narx_to_veriloga_paper import export_veriloga_hspice_split
-from narx_paper_v2 import NARX_Paper # 모델 껍데기 import
+from export_narx_to_veriloga_paper import export_veriloga_hspice_split_CONTINUOUS
+from narx_paper import NARX_Paper # 모델 껍데기 import
 from plot_transient import plot_transient
-from debug_sample_like_v3 import debug_spice_sampling_va_matched_CONTINUOUS
+from debug_sample_like import debug_spice_sampling_va_matched_CONTINUOUS
 
 # ------------------------------------------------------------
 # 경로 & 설정 (기존 main.py와 동일하게)
@@ -69,21 +69,26 @@ def main_evaluate():
     # 3. Verilog-A 파일로 익스포트 (기존 3번 블록)
     # =========================================================
     print("\n[Export] Exporting trained model to Verilog-A files...")
-    export_veriloga_hspice_split(
+    
+    export_veriloga_hspice_split_CONTINUOUS(
         model=model,
         scX=scX,
         R_ref_minmax=R_ref_minmax,
         ny=ny,
-        out_base=str(EXPORT_DIR / "narx_rram"),
-        module_name="narx_rram",
+        out_base=str(EXPORT_DIR / "narx_rram_cont"),
+        module_name="narx_rram_cont",
         Ts=1e-9,
         time_step=1e-9,
         init_w=1,
         warmup_steps=WARMUP_STEPS,
         r_clip_min=100.0,
         r_clip_max=1.0e8,
-        v_filter=0.01
+        v_filter=0.01,
+        V_READ_TH=0.6,
+        V_smooth_read=0.1,
+        hyst_smooth=0.1,
     )
+
     print(f"[Export] Files saved to {EXPORT_DIR}/narx_rram_assign.vams and ..._unrolled_math.inc")
 
     # =========================================================

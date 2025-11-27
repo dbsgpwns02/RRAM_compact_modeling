@@ -26,7 +26,7 @@ except ImportError:
     pass
     
 try:
-    from narx_paper_v2 import NARX_Paper
+    from narx_paper import NARX_Paper
 except ImportError:
     print("WARNING: narx_paper.py를 찾을 수 없어, 내부 클래스를 사용합니다.")
     # NARX_Paper 클래스가 이 파일 내에 정의되어 있어야 함
